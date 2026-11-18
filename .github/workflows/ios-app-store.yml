@@ -1,0 +1,512 @@
+name: Global Quran - iOS App Store Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "iOS build number (use a new number for every App Store Connect upload)"
+        required: true
+        type: string
+        default: "9"
+      upload_to_app_store_connect:
+        description: "Upload the verified IPA to App Store Connect after signing"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: global-quran-ios-app-store-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test-sign:
+    name: Build, test, sign and export App Store IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      BUILD_NUMBER: ${{ inputs.build_number || '9' }}
+      APP_BUNDLE_ID: com.globalquran.app
+      APP_VERSION: 2.0.2
+      SOURCE_ZIP: GlobalQuran-iOS-2.0.2-AppStore-CI-Ready.zip
+
+    steps:
+      - name: Check out the release repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Show Apple build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild -showsdks
+          sw_vers
+
+      - name: Extract the uploaded source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_PATH="$GITHUB_WORKSPACE/$SOURCE_ZIP"
+          if [[ ! -f "$ZIP_PATH" ]]; then
+            echo "ERROR: $SOURCE_ZIP was not found in the repository root."
+            echo "Upload the prepared source ZIP to the repository root without extracting it."
+            exit 1
+          fi
+
+          UNPACK_DIR="$RUNNER_TEMP/global-quran-source"
+          rm -rf "$UNPACK_DIR"
+          mkdir -p "$UNPACK_DIR"
+          unzip -q "$ZIP_PATH" -d "$UNPACK_DIR"
+
+          PACKAGE_JSON="$(find "$UNPACK_DIR" -maxdepth 5 -type f -name package.json -not -path '*/node_modules/*' -print -quit)"
+          if [[ -z "$PACKAGE_JSON" ]]; then
+            echo "ERROR: Could not find the project package.json inside the ZIP."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(cd "$(dirname "$PACKAGE_JSON")" && pwd)"
+          for required in \
+            "ios/App/App.xcodeproj/project.pbxproj" \
+            "ios/App/CapApp-SPM/Package.swift" \
+            "ios/App/App/public/index.html" \
+            "native/www/index.html" \
+            "bun.lock"; do
+            if [[ ! -f "$PROJECT_DIR/$required" ]]; then
+              echo "ERROR: Required project file is missing: $required"
+              exit 1
+            fi
+          done
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Extracted project: $PROJECT_DIR"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.4"
+
+      - name: Install locked JavaScript dependencies
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+
+      - name: Synchronize Capacitor iOS project and preserve native plugins
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run sync:ios
+
+      - name: Run cross-platform structural verification
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run verify:ios
+
+      - name: Resolve Xcode package dependencies
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project ios/App/App.xcodeproj \
+            -scheme App
+
+      - name: Run XCTest on an available iPhone Simulator
+        id: tests
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIMULATOR_UDID="$(xcrun simctl list devices available \
+            | grep -m 1 -E 'iPhone .*[0-9A-Fa-f-]{36}' \
+            | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')"
+
+          if [[ -z "$SIMULATOR_UDID" ]]; then
+            echo "ERROR: No available iPhone Simulator was found on this runner."
+            xcrun simctl list devices available
+            exit 1
+          fi
+
+          echo "Testing on Simulator UDID: $SIMULATOR_UDID"
+          TEST_RESULT_BUNDLE="$RUNNER_TEMP/GlobalQuran-XCTest.xcresult"
+          TEST_LOG="$RUNNER_TEMP/xcode-tests.log"
+          rm -rf "$TEST_RESULT_BUNDLE"
+
+          # Keep the complete Xcode log and print compiler diagnostics in the
+          # Actions step itself when a compile/test failure occurs.
+          if xcodebuild test \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -resultBundlePath "$TEST_RESULT_BUNDLE" \
+            -parallel-testing-enabled NO \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$TEST_LOG"; then
+            echo "PASS: XCTest completed successfully."
+          else
+            TEST_EXIT_CODE=$?
+            echo "::group::Xcode compiler and test diagnostics (last 160 matching lines)"
+            grep -n -E '(^|: )(error|warning):|Testing failed:|SwiftCompile|failed ' "$TEST_LOG" | tail -n 160 || true
+            echo "::endgroup::"
+            if [[ -d "$TEST_RESULT_BUNDLE" ]]; then
+              echo "::group::XCTest result summary"
+              xcrun xcresulttool get test-results summary --path "$TEST_RESULT_BUNDLE" --format json || true
+              echo "::endgroup::"
+            fi
+            exit "$TEST_EXIT_CODE"
+          fi
+
+      - name: Validate Apple App Store signing secrets and install credentials
+        id: signing
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        env:
+          IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for secret_name in \
+            IOS_CERTIFICATE_P12_BASE64 \
+            IOS_CERTIFICATE_PASSWORD \
+            IOS_PROVISIONING_PROFILE_BASE64 \
+            APPLE_TEAM_ID; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "ERROR: Required GitHub Secret is missing: $secret_name"
+              echo "The tests may pass, but an App Store-signed IPA cannot be created without all four signing secrets."
+              exit 1
+            fi
+          done
+
+          if [[ ! "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+            echo "ERROR: APPLE_TEAM_ID must be the 10-character Apple Developer Team ID."
+            exit 1
+          fi
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/global-quran-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          CERTIFICATE_PATH="$RUNNER_TEMP/GlobalQuran-AppleDistribution.p12"
+          PROFILE_PATH="$RUNNER_TEMP/GlobalQuran-AppStore.mobileprovision"
+          PROFILE_PLIST="$RUNNER_TEMP/GlobalQuran-AppStore-profile.plist"
+
+          printf '%s' "$IOS_CERTIFICATE_P12_BASE64" | /usr/bin/base64 -D > "$CERTIFICATE_PATH"
+          printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" | /usr/bin/base64 -D > "$PROFILE_PATH"
+
+          if [[ ! -s "$CERTIFICATE_PATH" || ! -s "$PROFILE_PATH" ]]; then
+            echo "ERROR: The P12 certificate or provisioning profile decoded to an empty file."
+            exit 1
+          fi
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$IOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s \
+            "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
+
+          IDENTITY_LIST="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")"
+          if ! grep -q 'Apple Distribution:' <<< "$IDENTITY_LIST"; then
+            echo "ERROR: The imported P12 does not contain a valid Apple Distribution signing identity."
+            echo "$IDENTITY_LIST"
+            exit 1
+          fi
+
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          PROFILE_PLIST="$PROFILE_PLIST" APPLE_TEAM_ID="$APPLE_TEAM_ID" APP_BUNDLE_ID="$APP_BUNDLE_ID" python3 - <<'PY'
+          import os
+          import plistlib
+          import sys
+          from datetime import datetime, timezone
+
+          profile_path = os.environ["PROFILE_PLIST"]
+          with open(profile_path, "rb") as handle:
+              profile = plistlib.load(handle)
+
+          team_id = os.environ["APPLE_TEAM_ID"]
+          bundle_id = os.environ["APP_BUNDLE_ID"]
+          team_ids = profile.get("TeamIdentifier", [])
+          entitlements = profile.get("Entitlements", {})
+          app_identifier = entitlements.get("application-identifier", "")
+          expiration = profile.get("ExpirationDate")
+
+          def fail(message):
+              print(f"ERROR: {message}", file=sys.stderr)
+              raise SystemExit(1)
+
+          if team_id not in team_ids:
+              fail("Provisioning profile TeamIdentifier does not match APPLE_TEAM_ID.")
+          if app_identifier != bundle_id and not app_identifier.endswith("." + bundle_id):
+              fail(f"Provisioning profile App ID does not explicitly match {bundle_id}: {app_identifier!r}")
+          if "*" in app_identifier:
+              fail("Wildcard App IDs are not accepted for this App Store release workflow.")
+          if entitlements.get("get-task-allow") is not False:
+              fail("Provisioning profile is not an App Store distribution profile (get-task-allow must be false).")
+          if profile.get("ProvisionedDevices") or profile.get("ProvisionsAllDevices"):
+              fail("A Development/Ad Hoc/Enterprise profile was supplied; use an App Store Connect profile.")
+          if expiration is None or expiration.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+              fail("The provisioning profile is expired or has no expiration date.")
+          if "iOS" not in profile.get("Platform", []):
+              fail("Provisioning profile is not for iOS.")
+
+          values = {
+              "IOS_PROFILE_UUID": profile.get("UUID", ""),
+              "IOS_PROFILE_NAME": profile.get("Name", ""),
+          }
+          if not all(values.values()):
+              fail("The provisioning profile is missing its UUID or Name.")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+
+          print("PASS: App Store provisioning profile matches the bundle ID and Apple Team ID.")
+          print(f"Profile name: {values['IOS_PROFILE_NAME']}")
+          print(f"Profile UUID: {values['IOS_PROFILE_UUID']}")
+          PY
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$IOS_PROFILE_UUID.mobileprovision"
+
+          echo "Signing certificate and App Store provisioning profile installed successfully."
+
+      - name: Archive and export the signed App Store IPA
+        id: export
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: BUILD_NUMBER must contain digits only."
+            exit 1
+          fi
+
+          ARCHIVE_PATH="$RUNNER_TEMP/GlobalQuran.xcarchive"
+          EXPORT_PATH="$RUNNER_TEMP/GlobalQuran-AppStore-Export"
+          DERIVED_DATA_PATH="$RUNNER_TEMP/GlobalQuran-DerivedData"
+          EXPORT_OPTIONS="$RUNNER_TEMP/ExportOptions-AppStore.plist"
+          ARTIFACT_DIR="$RUNNER_TEMP/GlobalQuran-AppStore-Artifacts"
+          rm -rf "$ARCHIVE_PATH" "$EXPORT_PATH" "$DERIVED_DATA_PATH" "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+
+          export APPLE_TEAM_ID APP_BUNDLE_ID IOS_PROFILE_NAME
+          python3 - "$EXPORT_OPTIONS" <<'PY'
+          import os
+          import plistlib
+          import sys
+
+          export_options = {
+              "method": "app-store-connect",
+              "destination": "export",
+              "teamID": os.environ["APPLE_TEAM_ID"],
+              "signingStyle": "manual",
+              "signingCertificate": "Apple Distribution",
+              "provisioningProfiles": {
+                  os.environ["APP_BUNDLE_ID"]: os.environ["IOS_PROFILE_NAME"]
+              },
+              "stripSwiftSymbols": True,
+              "uploadSymbols": True,
+              "manageAppVersionAndBuildNumber": False,
+          }
+          with open(sys.argv[1], "wb") as handle:
+              plistlib.dump(export_options, handle, sort_keys=False)
+          PY
+
+          xcodebuild archive \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            'CODE_SIGN_IDENTITY=Apple Distribution' \
+            "PROVISIONING_PROFILE_SPECIFIER=$IOS_PROFILE_NAME" \
+            "PROVISIONING_PROFILE=$IOS_PROFILE_UUID" \
+            "PRODUCT_BUNDLE_IDENTIFIER=$APP_BUNDLE_ID" \
+            "CURRENT_PROJECT_VERSION=$BUILD_NUMBER" \
+            2>&1 | tee "$RUNNER_TEMP/xcode-archive.log"
+
+          if [[ ! -d "$ARCHIVE_PATH/Products/Applications/App.app" ]]; then
+            echo "ERROR: Xcode archive completed without the expected App.app product."
+            exit 1
+          fi
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist "$EXPORT_OPTIONS" \
+            2>&1 | tee "$RUNNER_TEMP/xcode-export.log"
+
+          IPA_CANDIDATE="$(find "$EXPORT_PATH" -maxdepth 3 -type f -name '*.ipa' -print -quit)"
+          if [[ -z "$IPA_CANDIDATE" || ! -s "$IPA_CANDIDATE" ]]; then
+            echo "ERROR: Xcode did not produce a non-empty IPA."
+            exit 1
+          fi
+
+          FINAL_IPA="$ARTIFACT_DIR/GlobalQuran-${APP_VERSION}-${BUILD_NUMBER}-AppStore.ipa"
+          cp "$IPA_CANDIDATE" "$FINAL_IPA"
+          CHECK_DIR="$RUNNER_TEMP/GlobalQuran-IPA-Check"
+          rm -rf "$CHECK_DIR"
+          mkdir -p "$CHECK_DIR"
+          unzip -q "$FINAL_IPA" -d "$CHECK_DIR"
+
+          APP_PATH="$(find "$CHECK_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [[ -z "$APP_PATH" || ! -d "$APP_PATH" ]]; then
+            echo "ERROR: The exported IPA does not contain Payload/*.app."
+            exit 1
+          fi
+
+          INFO_PLIST="$APP_PATH/Info.plist"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")"
+          SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")"
+          ACTUAL_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST")"
+
+          [[ "$BUNDLE_ID" == "$APP_BUNDLE_ID" ]] || { echo "ERROR: Wrong Bundle ID: $BUNDLE_ID"; exit 1; }
+          [[ "$SHORT_VERSION" == "$APP_VERSION" ]] || { echo "ERROR: Wrong marketing version: $SHORT_VERSION"; exit 1; }
+          [[ "$ACTUAL_BUILD" == "$BUILD_NUMBER" ]] || { echo "ERROR: Wrong build number: $ACTUAL_BUILD"; exit 1; }
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          SIGNATURE_INFO="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1)"
+          grep -q 'Authority=Apple Distribution:' <<< "$SIGNATURE_INFO" || {
+            echo "ERROR: Exported IPA is not signed with an Apple Distribution certificate."
+            echo "$SIGNATURE_INFO"
+            exit 1
+          }
+          grep -q "TeamIdentifier=$APPLE_TEAM_ID" <<< "$SIGNATURE_INFO" || {
+            echo "ERROR: Exported signature TeamIdentifier does not match APPLE_TEAM_ID."
+            echo "$SIGNATURE_INFO"
+            exit 1
+          }
+
+          ENTITLEMENTS_PATH="$RUNNER_TEMP/GlobalQuran-signed-entitlements.plist"
+          codesign -d --entitlements :- "$APP_PATH" > "$ENTITLEMENTS_PATH" 2>/dev/null
+          SIGNED_APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$ENTITLEMENTS_PATH")"
+          SIGNED_TEAM_ID="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS_PATH")"
+          GET_TASK_ALLOW="$(/usr/libexec/PlistBuddy -c 'Print :get-task-allow' "$ENTITLEMENTS_PATH")"
+
+          [[ "$SIGNED_APP_ID" != *"*"* && ( "$SIGNED_APP_ID" == "$APP_BUNDLE_ID" || "$SIGNED_APP_ID" == *".$APP_BUNDLE_ID" ) ]] || {
+            echo "ERROR: Signed application-identifier does not explicitly match $APP_BUNDLE_ID: $SIGNED_APP_ID"
+            exit 1
+          }
+          [[ "$SIGNED_TEAM_ID" == "$APPLE_TEAM_ID" ]] || { echo "ERROR: Signed Team ID mismatch: $SIGNED_TEAM_ID"; exit 1; }
+          [[ "$GET_TASK_ALLOW" == "false" ]] || { echo "ERROR: get-task-allow must be false for App Store distribution."; exit 1; }
+
+          IPA_SHA256="$(shasum -a 256 "$FINAL_IPA" | awk '{print $1}')"
+          cat > "$ARTIFACT_DIR/Build-Verification.txt" <<EOF
+          Product: Global Quran
+          Distribution: App Store Connect (Apple Distribution signed)
+          Bundle ID: $BUNDLE_ID
+          Version: $SHORT_VERSION
+          Build: $ACTUAL_BUILD
+          Team ID: $APPLE_TEAM_ID
+          Signature: codesign --verify --deep --strict passed
+          Signing identity: Apple Distribution
+          App Store entitlements: explicit App ID; get-task-allow=false
+          IPA SHA-256: $IPA_SHA256
+          EOF
+
+          echo "ipa_path=$FINAL_IPA" >> "$GITHUB_OUTPUT"
+          echo "artifact_dir=$ARTIFACT_DIR" >> "$GITHUB_OUTPUT"
+          echo "PASS: Verified signed App Store IPA: $FINAL_IPA"
+          echo "SHA-256: $IPA_SHA256"
+
+      - name: Validate and upload IPA to App Store Connect
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_to_app_store_connect }}
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.export.outputs.ipa_path }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          for secret_name in \
+            APP_STORE_CONNECT_API_KEY_ID \
+            APP_STORE_CONNECT_ISSUER_ID \
+            APP_STORE_CONNECT_API_KEY_P8_BASE64; do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "ERROR: Upload was requested, but GitHub Secret $secret_name is missing."
+              exit 1
+            fi
+          done
+
+          PRIVATE_KEYS_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$PRIVATE_KEYS_DIR"
+          chmod 700 "$HOME/.appstoreconnect" "$PRIVATE_KEYS_DIR"
+          API_KEY_PATH="$PRIVATE_KEYS_DIR/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_P8_BASE64" | /usr/bin/base64 -D > "$API_KEY_PATH"
+          chmod 600 "$API_KEY_PATH"
+
+          xcrun altool --validate-app \
+            --type ios \
+            --file "$IPA_PATH" \
+            --apiKey "$APP_STORE_CONNECT_API_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$IPA_PATH" \
+            --apiKey "$APP_STORE_CONNECT_API_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+
+          echo "Upload command completed. Apple must process the build before it appears in App Store Connect."
+
+      - name: Upload signed IPA artifact
+        if: ${{ always() && steps.export.outputs.artifact_dir != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: GlobalQuran-iOS-AppStore-IPA-${{ github.run_number }}
+          path: ${{ steps.export.outputs.artifact_dir }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Xcode test and build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: GlobalQuran-iOS-Diagnostics-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/xcode-tests.log
+            ${{ runner.temp }}/xcode-archive.log
+            ${{ runner.temp }}/xcode-export.log
+            ${{ runner.temp }}/GlobalQuran-XCTest.xcresult
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Remove temporary signing credentials
+        if: always()
+        shell: bash
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+        run: |
+          set +e
+          if [[ -n "${KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1
+          fi
+          rm -f "$RUNNER_TEMP/GlobalQuran-AppleDistribution.p12"
+          rm -f "$RUNNER_TEMP/GlobalQuran-AppStore.mobileprovision"
+          rm -f "$RUNNER_TEMP/GlobalQuran-AppStore-profile.plist"
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID:-UNUSED}.p8"
